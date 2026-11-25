@@ -3,6 +3,7 @@
 #include <setjmp.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdnoreturn.h>
 
 #define STACK_SIZE 64 * 1024 // 默认协程栈大小为 64KB
 #define MAX_CO 128           // 最大协程数量
@@ -90,12 +91,12 @@ void co_wait(struct co *co) {
     while (co->status != CO_DEAD) {
       co_yield ();
     }
-  } else {
-    // 被等待的协程已经结束，释放资源
-    all_remove(co);
-    free(co);
-    return;
+    // 等待的协程已经结束，当前协程被唤醒，继续执行
+    current->status = CO_RUNNING;
   }
+  all_remove(co);
+  free(co);
+  return;
 }
 
 // 从可选择的协程中选择一个协程执行
@@ -146,13 +147,14 @@ static inline void stack_switch_call(void *sp, void *entry, uintptr_t arg) {
  *        因此该函数不能返回，否则会跳转到未知地址，导致程序崩溃
  * @param co 目标协程
  */
-static void co_entry(struct co *co) {
+[[noreturn]] static void co_entry(struct co *co) {
   co->func(co->arg);    // 执行协程函数
   co->status = CO_DEAD; // 执行完毕
   // 如果有协程在等待该协程执行完毕，唤醒它
   if (co->waiter) {
     // 切换到等待协程的上下文
     co->waiter->status = CO_RUNNING;
+    current = co->waiter;
     longjmp(co->waiter->context, 1);
   }
   // 让出 CPU，切换到其他协程执行
@@ -185,7 +187,7 @@ void co_yield () {
       // 调用 stack_switch_call 切换到 next 协程的栈执行
       next->status = CO_RUNNING;
       stack_switch_call(next->stack + STACK_SIZE - OFFSET, (void *)co_entry,
-                        (uintptr_t)next->arg);
+                        (uintptr_t)next);
     } else {
       // 否则直接切换到 next 协程执行
       longjmp(next->context, 1);
@@ -194,4 +196,17 @@ void co_yield () {
     // setjmp 第二次返回，说明当前协程被唤醒，继续执行
     return;
   }
+}
+
+// 提供 main 函数的协程入口，main 也是协程
+__attribute__((constructor)) static void co_init() {
+  // 初始化 main 协程
+  static struct co main_co;
+  main_co.name = "main";
+  main_co.func = NULL;
+  main_co.arg = NULL;
+  main_co.status = CO_RUNNING;
+  main_co.waiter = NULL;
+  current = &main_co;
+  all_add(&main_co);
 }
